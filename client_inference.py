@@ -94,8 +94,7 @@ class PID:
         self.sample_time = sample_time
 
 # Global variables for enemy tracking
-enemy_vehicle = None
-enemy_server_url = None
+enemy_client = None
 visualization_origin = None
 lock_start_time = None
 current_lock_duration = 0.0
@@ -144,31 +143,101 @@ def lla_to_enu(target_lat, target_lon, target_alt, ref_lat, ref_lon, ref_alt):
     target_ecef = lla_to_ecef(target_lat, target_lon, target_alt)
     return ecef_to_enu(target_ecef, ref_lat, ref_lon, ref_alt)
 
-def setup_enemy_tracking(method='mavlink', address=None):
-    """Setup enemy tracking method"""
-    global enemy_vehicle, enemy_server_url
+class EnemyDataClient:
+    """Client to get enemy aircraft data from network server"""
+    def __init__(self, server_ip, port=6666):
+        self.server_ip = server_ip
+        self.port = port
+        self.socket = None
+        self.connected = False
+        self.last_data = None
+        self.last_request_time = 0
+        self.min_request_interval = 0.05  # Max 20Hz requests
+        
+    def connect(self):
+        """Connect to enemy data server"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(2.0)
+            self.socket.connect((self.server_ip, self.port))
+            self.connected = True
+            print(f"Connected to enemy data server at {self.server_ip}:{self.port}")
+            return True
+        except Exception as e:
+            print(f"Failed to connect to enemy server: {e}")
+            self.connected = False
+            return False
     
-    if method == 'mavlink' and address:
-        enemy_vehicle = connect(address, wait_ready=True)
-        print(f"Connected to enemy vehicle at {address}")
-    elif method == 'server' and address:
-        enemy_server_url = address
-        print(f"Will fetch enemy data from server: {address}")
+    def get_enemy_data(self):
+        """Request and receive enemy data from server"""
+        if not self.connected:
+            if not self.connect():
+                return None
+        
+        # Rate limit requests
+        current_time = time.time()
+        if current_time - self.last_request_time < self.min_request_interval:
+            return self.last_data  # Return cached data
+        
+        try:
+            # Send request
+            request = {'type': 'get_data'}
+            json_request = json.dumps(request)
+            self.socket.sendall(json_request.encode('utf-8'))
+            
+            # Receive response
+            response_bytes = self.socket.recv(4096)
+            response = json.loads(response_bytes.decode('utf-8'))
+            
+            if response['type'] == 'enemy_data':
+                self.last_data = response['data']
+                self.last_request_time = current_time
+                return response['data']
+            else:
+                print(f"Error from server: {response.get('message', 'Unknown error')}")
+                return None
+                
+        except socket.timeout:
+            print("Timeout getting enemy data")
+            return self.last_data
+        except Exception as e:
+            print(f"Error getting enemy data: {e}")
+            self.connected = False
+            self.socket.close()
+            return None
+    
+    def close(self):
+        """Close connection to server"""
+        if self.socket:
+            try:
+                request = {'type': 'disconnect'}
+                json_request = json.dumps(request)
+                self.socket.sendall(json_request.encode('utf-8'))
+            except:
+                pass
+            finally:
+                self.socket.close()
+                self.connected = False
+                print("Disconnected from enemy data server")
 
-def get_enemy_data_from_mavlink():
-    """Get enemy aircraft data from MAVLink connection"""
-    if enemy_vehicle is None:
+def setup_enemy_tracking(server_ip, port=6666):
+    """Setup enemy tracking via network server"""
+    global enemy_client
+    
+    enemy_client = EnemyDataClient(server_ip, port)
+    if enemy_client.connect():
+        print(f"Enemy tracking setup complete")
+        return True
+    else:
+        print(f"Failed to setup enemy tracking")
+        return False
+
+def get_enemy_data_from_network():
+    """Get enemy aircraft data from network server"""
+    if enemy_client is None:
         return None
     
-    return {
-        'lat': enemy_vehicle.location.global_frame.lat,
-        'lon': enemy_vehicle.location.global_frame.lon,
-        'alt': enemy_vehicle.location.global_frame.alt,
-        'roll': enemy_vehicle.attitude.roll,
-        'pitch': enemy_vehicle.attitude.pitch,
-        'heading': enemy_vehicle.heading,
-        'velocity': enemy_vehicle.velocity
-    }
+    return enemy_client.get_enemy_data()
 
 def calculate_los_angles_and_errors(enu_vector, own_heading, own_pitch):
     """Calculate Line of Sight angles and errors"""
@@ -226,10 +295,11 @@ def get_state_for_ground_station(vehicle, target_attitude, pid_roll, pid_pitch):
         visualization_origin = (own_lat, own_lon, own_alt)
         print(f"Origin set to: Lat={own_lat:.6f}, Lon={own_lon:.6f}, Alt={own_alt:.1f}m")
     
-    # Get enemy aircraft data
-    if enemy_vehicle is not None:
-        enemy_data = get_enemy_data_from_mavlink()
-    else:
+    # Get enemy aircraft data from network
+    enemy_data = get_enemy_data_from_network()
+    
+    if enemy_data is None:
+        # Use default values if no enemy data available
         enemy_data = {
             'lat': own_lat,
             'lon': own_lon,
@@ -239,9 +309,6 @@ def get_state_for_ground_station(vehicle, target_attitude, pid_roll, pid_pitch):
             'heading': 0,
             'velocity': [0, 0, 0]
         }
-    
-    if enemy_data is None:
-        return None
     
     # Calculate relative ENU
     enu_enemy_relative = lla_to_enu(
@@ -366,8 +433,8 @@ def update_attitude(action, target_attitude):
     return target_attitude
 
 def apply_action(vehicle, target_attitude):
-    """Apply target attitude to vehicle via RC channels"""
-    if vehicle.mode = VehicleMode("FBWB"):
+    if vehicle.mode == VehicleMode("FBWB"):
+        """Apply target attitude to vehicle via RC channels"""
         roll_val = target_attitude[0]
         pitch_val = target_attitude[1]
         throttle_val = target_attitude[2]
@@ -467,14 +534,15 @@ def main():
     agent_period = control_freq // agent_freq  # 4 control steps per agent step
     
     # Parse arguments
-    if len(sys.argv) != 4:
-        print("Usage: python uav_client.py <flight_time> <ground_station_ip> <mavlink_address>")
-        print("Example: python uav_client.py 60 192.168.1.172 127.0.0.1:14550")
+    if len(sys.argv) != 5:
+        print("Usage: python uav_client.py <flight_time> <ground_station_ip> <mavlink_address> <enemy_server_ip>")
+        print("Example: python uav_client.py 60 192.168.1.172 127.0.0.1:14550 192.168.1.173")
         sys.exit(1)
     
     flight_time = float(sys.argv[1])
     ground_station_ip = sys.argv[2]
     machine_address = sys.argv[3]
+    enemy_server_ip = sys.argv[4]
     
     # Setup
     try:
@@ -484,8 +552,9 @@ def main():
         # Connect to vehicle
         vehicle = connect_mavlink(machine_address)
         
-        # Setup enemy tracking (optional)
-        setup_enemy_tracking(method='mavlink', address='127.0.0.1:14551')
+        # Setup enemy tracking via network
+        if not setup_enemy_tracking(enemy_server_ip, port=6666):
+            print("Warning: Enemy tracking setup failed, continuing without enemy data")
         
         # Initialize PID controllers
         pid_roll = PID(P=0.5, I=0.1, D=0.05)  # Adjust to your values
@@ -523,7 +592,8 @@ def main():
                     # Update target attitude
                     target_attitude = update_attitude(action, target_attitude)
                     
-                    print(f"Step {i}: Action={action}, Target attitude={target_attitude}")
+                    if i % (agent_period * 5) == 0:  # Print every second
+                        print(f"Step {i}: Action={action}, Target attitude={target_attitude}, Distance={state[0]:.1f}m")
             
             # Update PID controllers
             current_roll = vehicle.attitude.roll * 180 / np.pi
@@ -597,6 +667,8 @@ def main():
                 pass
     finally:
         # Clean up
+        if 'enemy_client' in locals() and enemy_client:
+            enemy_client.close()
         if 'gs_client' in locals():
             gs_client.close()
         if 'vehicle' in locals():
