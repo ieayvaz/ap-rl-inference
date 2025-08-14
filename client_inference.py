@@ -367,19 +367,20 @@ def update_attitude(action, target_attitude):
 
 def apply_action(vehicle, target_attitude):
     """Apply target attitude to vehicle via RC channels"""
-    roll_val = target_attitude[0]
-    pitch_val = target_attitude[1]
-    throttle_val = target_attitude[2]
-    
-    roll_ref = int(np.interp(roll_val, [ROLL_MIN, ROLL_MAX], [ROLL_CHANNEL_MIN, ROLL_CHANNEL_MAX]))
-    alt_ref = int(PITCH_CHANNEL_TRIM)
-    airspeed_ref = int(THROTTLE_CHANNEL_TRIM)
-    
-    vehicle.channels.overrides = {
-        '1': roll_ref,
-        '2': alt_ref,
-        '3': airspeed_ref
-    }
+    if vehicle.mode = VehicleMode("FBWB"):
+        roll_val = target_attitude[0]
+        pitch_val = target_attitude[1]
+        throttle_val = target_attitude[2]
+        
+        roll_ref = int(np.interp(roll_val, [ROLL_MIN, ROLL_MAX], [ROLL_CHANNEL_MIN, ROLL_CHANNEL_MAX]))
+        alt_ref = int(PITCH_CHANNEL_TRIM)
+        airspeed_ref = int(THROTTLE_CHANNEL_TRIM)
+        
+        vehicle.channels.overrides = {
+            '1': roll_ref,
+            '2': alt_ref,
+            '3': airspeed_ref
+        }
 
 class GroundStationClient:
     """Client to communicate with ground station running the ML model"""
