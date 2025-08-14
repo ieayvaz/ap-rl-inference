@@ -45,7 +45,7 @@ STATE_BOUNDS = {
     'relative_velocity_x': (-50, 50),
     'relative_velocity_y': (-50, 50),
     'relative_velocity_z': (-25, 25),
-    'q_radps': (-1, 1),  # Assuming normalized angular velocities
+    'q_radps': (-1, 1),
     'p_radps': (-1, 1),
     'r_radps': (-1, 1),
     'current_lock_duration': (0, 10),
@@ -138,6 +138,9 @@ class PID:
 # Global variables for enemy tracking
 enemy_vehicle = None  # MAVLink connection to enemy drone
 enemy_server_url = None  # Server URL for enemy data
+
+# Global origin for absolute positioning
+visualization_origin = None  # Will store (lat, lon, alt) of initial position
 
 def lla_to_ecef(lat, lon, alt):
     """
@@ -390,20 +393,14 @@ def normalize_state(state):
     
     return normalized_state.astype(np.float32)
 
-def get_state(vehicle, target_attitude, pid_roll, pid_pitch):
+def get_state_with_absolute_positions(vehicle, target_attitude, pid_roll, pid_pitch):
     """
-    Extract state observation for the RL model
-    
-    Args:
-        vehicle: DroneKit vehicle object (own aircraft)
-        target_attitude: [roll, pitch, throttle] target values
-        pid_roll: PID controller for roll
-        pid_pitch: PID controller for pitch
+    Extract state observation for the RL model and absolute positions for visualization
     
     Returns:
-        numpy array of state variables (39 elements)
+        tuple: (state, own_enu_pos, enemy_enu_pos, additional_info)
     """
-    global lock_start_time, current_lock_duration
+    global lock_start_time, current_lock_duration, visualization_origin
     
     # Get own aircraft data
     own_lat = vehicle.location.global_frame.lat
@@ -413,6 +410,11 @@ def get_state(vehicle, target_attitude, pid_roll, pid_pitch):
     own_pitch = vehicle.attitude.pitch
     own_heading = vehicle.heading
     own_velocity = vehicle.velocity  # [North, East, Down] m/s
+    
+    # Set origin on first call
+    if visualization_origin is None:
+        visualization_origin = (own_lat, own_lon, own_alt)
+        print(f"Visualization origin set to: Lat={own_lat:.6f}, Lon={own_lon:.6f}, Alt={own_alt:.1f}m")
     
     # Get enemy aircraft data
     if enemy_vehicle is not None:
@@ -432,22 +434,29 @@ def get_state(vehicle, target_attitude, pid_roll, pid_pitch):
         }
     
     if enemy_data is None:
-        return None
+        return None, None, None, None
     
-    # Calculate distances using ENU coordinates
-    own_pos = {'lat': own_lat, 'lon': own_lon, 'alt': own_alt}
-    enemy_pos = {'lat': enemy_data['lat'], 'lon': enemy_data['lon'], 'alt': enemy_data['alt']}
+    # Calculate absolute ENU positions relative to visualization origin
+    own_enu_absolute = lla_to_enu(
+        own_lat, own_lon, own_alt,
+        visualization_origin[0], visualization_origin[1], visualization_origin[2]
+    )
     
-    # Get enemy position in ENU coordinates relative to own position
-    enu_enemy = lla_to_enu(
+    enemy_enu_absolute = lla_to_enu(
+        enemy_data['lat'], enemy_data['lon'], enemy_data['alt'],
+        visualization_origin[0], visualization_origin[1], visualization_origin[2]
+    )
+    
+    # Calculate relative ENU for state vector (enemy relative to own)
+    enu_enemy_relative = lla_to_enu(
         enemy_data['lat'], enemy_data['lon'], enemy_data['alt'],
         own_lat, own_lon, own_alt
     )
     
     # ENU components: East, North, Up
-    distance_east = enu_enemy[0]
-    distance_north = enu_enemy[1]
-    distance_up = enu_enemy[2]
+    distance_east = enu_enemy_relative[0]
+    distance_north = enu_enemy_relative[1]
+    distance_up = enu_enemy_relative[2]
     
     # For state vector, use ENU ordering: x=East, y=North, z=Up
     distance_x = distance_east   # East component
@@ -480,7 +489,6 @@ def get_state(vehicle, target_attitude, pid_roll, pid_pitch):
     relative_velocity_z = enemy_data['velocity'][2] - own_velocity[2]  # Down
     
     # Angular velocities (rad/s)
-    # Using gyro data if available, otherwise estimate from attitude changes
     try:
         p_radps = vehicle.raw_imu.xgyro / 1000.0  # Convert from mrad/s to rad/s
         q_radps = vehicle.raw_imu.ygyro / 1000.0
@@ -493,7 +501,7 @@ def get_state(vehicle, target_attitude, pid_roll, pid_pitch):
     
     # Calculate LOS angles and errors using your exact method
     los_azimuth, los_elevation, azimuth_error_deg, elevation_error_deg = \
-        calculate_los_angles_and_errors(enu_enemy, own_heading, own_pitch)
+        calculate_los_angles_and_errors(enu_enemy_relative, own_heading, own_pitch)
     
     # Convert errors to radians for state vector (keeping degrees for lock check)
     los_azimuth_error_rad = math.radians(azimuth_error_deg)
@@ -547,7 +555,25 @@ def get_state(vehicle, target_attitude, pid_roll, pid_pitch):
         prev_pitch_pid_pterm, prev_pitch_pid_iterm, prev_pitch_pid_dterm
     ], dtype=np.float32)
     
-    return state
+    # Additional info for visualization
+    additional_info = {
+        'own_roll': own_roll,
+        'own_pitch': own_pitch,
+        'own_heading': own_heading,
+        'enemy_roll': enemy_data['roll'],
+        'enemy_pitch': enemy_data['pitch'],
+        'enemy_heading': enemy_data['heading'],
+        'distance_3d': distance_3d,
+        'lock_status': current_lock_status,
+        'lock_duration': current_lock_duration,
+        'target_roll': target_roll,
+        'target_pitch': target_pitch,
+        'target_throttle': target_throttle,
+        'azimuth_error': azimuth_error_deg,
+        'elevation_error': elevation_error_deg
+    }
+    
+    return state, own_enu_absolute, enemy_enu_absolute, additional_info
 
 def update_attitude(action, target_attitude):
     """Update target attitude based on action deltas"""
@@ -632,7 +658,9 @@ def main():
         print(f"Vehicle mode set to: {vehicle.mode}")
         
         # Get initial observation
-        obs = get_state(vehicle, target_attitude, pid_roll, pid_pitch)
+        state, own_enu_pos, enemy_enu_pos, vis_info = get_state_with_absolute_positions(
+            vehicle, target_attitude, pid_roll, pid_pitch
+        )
         
         # Main control loop
         next_time = time.perf_counter()
@@ -644,18 +672,30 @@ def main():
         for i in range(total_steps):
             # Agent inference at 5Hz
             if i % agent_period == 0:
-                obs = get_state(vehicle, target_attitude, pid_roll, pid_pitch)
+                state, own_enu_pos, enemy_enu_pos, vis_info = get_state_with_absolute_positions(
+                    vehicle, target_attitude, pid_roll, pid_pitch
+                )
 
-                if visualize:
-                    visualizer.update_state(obs)
+                if visualize and state is not None:
+                    # Update visualizer with absolute positions
+                    visualizer.update_absolute_positions(
+                        own_enu_pos, 
+                        enemy_enu_pos, 
+                        vis_info
+                    )
                     visualizer.update_plot()
-                    attitude_monitor.update_state(obs)
+                    
+                    if attitude_monitor:
+                        attitude_monitor.update_state(state)
 
-                obs_norm = normalize_state(obs)
-                if obs_norm is not None:  # Only predict if we have valid state
+                if state is not None:
+                    obs_norm = normalize_state(state)
                     action, _ = model.predict(obs_norm, deterministic=False) 
                     target_attitude = update_attitude(action, target_attitude)
                     print(f"Step {i}: Action={action}, Target attitude={target_attitude}")
+                    print(f"  Own ENU: [{own_enu_pos[0]:.1f}, {own_enu_pos[1]:.1f}, {own_enu_pos[2]:.1f}]")
+                    print(f"  Enemy ENU: [{enemy_enu_pos[0]:.1f}, {enemy_enu_pos[1]:.1f}, {enemy_enu_pos[2]:.1f}]")
+                    print(f"  Distance: {vis_info['distance_3d']:.1f}m, Lock: {vis_info['lock_status']}")
             
             # Update PID controllers
             current_roll = vehicle.attitude.roll * 180 / np.pi  # Convert to degrees
@@ -679,6 +719,8 @@ def main():
         print("\nFlight interrupted by user")
     except Exception as e:
         print(f"Error during flight: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Clean up
         if 'vehicle' in locals():
